@@ -42,14 +42,14 @@ fn main() -> anyhow::Result<()> {
             let model_path = cli
                 .model
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| config::default_model_path());
+                .unwrap_or_else(config::default_model_path);
             ui::popup::run_popup(lang, model_path)
         }
         Some(Commands::Listen { lang, duration: _ }) => {
             let model_path = cli
                 .model
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| config::default_model_path());
+                .unwrap_or_else(config::default_model_path);
 
             eprintln!("Loading model from {}...", model_path.display());
             let engine = transcribe::whisper::WhisperEngine::load(&model_path)?;
@@ -84,7 +84,7 @@ fn main() -> anyhow::Result<()> {
             let model_path = cli
                 .model
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| config::default_model_path());
+                .unwrap_or_else(config::default_model_path);
             ui::popup::run_popup("en".to_string(), model_path)
         }
     }

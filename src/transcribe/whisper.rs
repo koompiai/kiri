@@ -41,12 +41,11 @@ impl WhisperEngine {
 
         let mut text = String::new();
         for i in 0..n_segments {
-            if let Some(segment) = state.get_segment(i) {
-                if let Ok(s) = segment.to_str() {
+            if let Some(segment) = state.get_segment(i)
+                && let Ok(s) = segment.to_str() {
                     text.push_str(s.trim());
                     text.push(' ');
                 }
-            }
         }
 
         Ok(text.trim().to_string())

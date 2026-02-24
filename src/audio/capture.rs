@@ -89,18 +89,16 @@ impl AudioCapture {
                         speech_start = Some(now);
                     }
                 } else if speech_detected {
-                    if let Some(start) = speech_start {
-                        if now.duration_since(start).as_secs_f32() < SPEECH_MIN_DURATION {
+                    if let Some(start) = speech_start
+                        && now.duration_since(start).as_secs_f32() < SPEECH_MIN_DURATION {
                             return;
                         }
-                    }
                     if silence_start.is_none() {
                         silence_start = Some(now);
-                    } else if let Some(start) = silence_start {
-                        if now.duration_since(start).as_secs_f32() >= silence_duration {
+                    } else if let Some(start) = silence_start
+                        && now.duration_since(start).as_secs_f32() >= silence_duration {
                             stop.store(true, Ordering::Relaxed);
                         }
-                    }
                 }
             },
             move |err| {
