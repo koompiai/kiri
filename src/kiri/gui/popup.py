@@ -19,15 +19,17 @@ from kiri.transcription.engine import WhisperEngine
 
 
 class VoicePopup(Gtk.Application):
-    def __init__(self, language: str, model_name: str, device: str):
+    def __init__(self, language: str, model_name: str, device: str, mode: str = "type"):
         super().__init__(application_id="com.kiri.popup")
         self.language = language
         self.model_name = model_name
         self.ov_device = device
+        self.mode = mode
         self.state = State.LOADING
         self.recorder = AudioRecorder()
         self.engine = WhisperEngine(model_name=model_name, device=device)
         self.pulse_phase = 0.0
+        self._pending_text = ""
 
     def do_activate(self):
         # CSS
@@ -51,6 +53,9 @@ class VoicePopup(Gtk.Application):
         Gtk4LayerShell.set_anchor(self.win, Gtk4LayerShell.Edge.RIGHT, True)
         Gtk4LayerShell.set_margin(self.win, Gtk4LayerShell.Edge.TOP, 12)
         Gtk4LayerShell.set_margin(self.win, Gtk4LayerShell.Edge.RIGHT, 12)
+        Gtk4LayerShell.set_keyboard_mode(
+            self.win, Gtk4LayerShell.KeyboardMode.ON_DEMAND,
+        )
 
         # Escape key
         key_ctrl = Gtk.EventControllerKey()
@@ -158,7 +163,7 @@ class VoicePopup(Gtk.Application):
                 self.dot.add_css_class("dot-done")
                 self.dot.set_text("\u2713")
                 text = kwargs.get("text", "")
-                self.status_label.set_text("Saved")
+                self.status_label.set_text("Saved" if self.mode == "notes" else "Typing...")
                 self.info_label.set_text(text)
                 self.info_label.remove_css_class("error-label")
                 self.info_label.add_css_class("result-text")
@@ -214,7 +219,28 @@ class VoicePopup(Gtk.Application):
             GLib.timeout_add(2000, lambda: self.quit())
             return
 
-        # Save
-        filepath = save_to_notes(text)
-        self._set_state(State.RESULT, text=text, filepath=str(filepath))
-        GLib.timeout_add(3000, lambda: self.quit())
+        # Deliver result
+        if self.mode == "notes":
+            save_to_notes(text)
+            self._set_state(State.RESULT, text=text)
+            GLib.timeout_add(3000, lambda: self.quit())
+        else:
+            self._set_state(State.RESULT, text=text)
+            self._pending_text = text
+            GLib.timeout_add(1000, self._type_and_quit)
+
+    def _type_and_quit(self):
+        """Close popup, return focus to previous app, then type the text."""
+        text = self._pending_text
+        self.win.set_visible(False)
+        # Small delay for focus to return to previous window
+        GLib.timeout_add(200, self._do_type, text)
+        return False
+
+    def _do_type(self, text):
+        from kiri.output.typer import type_text
+        if not type_text(text):
+            from kiri.output.clipboard import copy_to_clipboard
+            copy_to_clipboard(text)
+        self.quit()
+        return False
