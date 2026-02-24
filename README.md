@@ -30,6 +30,27 @@ kiri --check
 kiri-sync --status
 ```
 
+## Keybinding
+
+Bind the popup to a key so you can record with a single press:
+
+```bash
+# Bind to the Copilot/AI key (Lenovo, etc.)
+kiri-popup --bind copilot
+
+# Or any key combo
+kiri-popup --bind "Meta+V"
+kiri-popup --bind F9
+
+# Check current binding
+kiri-popup --keybinding
+
+# Remove binding
+kiri-popup --unbind
+```
+
+Supports KDE Plasma and GNOME. Log out and back in to activate.
+
 ## Uninstall
 
 ```bash
