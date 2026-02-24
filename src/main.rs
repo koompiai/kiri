@@ -40,18 +40,44 @@ fn main() -> anyhow::Result<()> {
             eprintln!("popup: lang={lang}, model={:?}", cli.model);
             todo!("popup not implemented yet")
         }
-        Some(Commands::Listen { lang, duration }) => {
-            eprintln!("listen: lang={lang}, duration={duration}");
-            todo!("listen not implemented yet")
+        Some(Commands::Listen { lang, duration: _ }) => {
+            let model_path = cli
+                .model
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| config::default_model_path());
+
+            eprintln!("Loading model from {}...", model_path.display());
+            let engine = transcribe::whisper::WhisperEngine::load(&model_path)?;
+            eprintln!("Model ready.");
+
+            eprintln!("Recording... (Ctrl+C to stop)");
+            let capture = audio::capture::AudioCapture::new();
+            let raw_audio = capture.record_with_silence()?;
+
+            if raw_audio.len() < config::RECORD_RATE as usize {
+                anyhow::bail!("Recording too short, discarding.");
+            }
+
+            eprintln!("Resampling...");
+            let audio_16k = audio::resample::resample_48k_to_16k(&raw_audio);
+
+            eprintln!("Transcribing...");
+            let text = engine.transcribe(&audio_16k, &lang)?;
+
+            if text.is_empty() {
+                anyhow::bail!("No speech detected.");
+            }
+
+            println!("{text}");
+            Ok(())
         }
         Some(Commands::Sync) => {
             eprintln!("sync");
             todo!("sync not implemented yet")
         }
         None => {
-            // Default: popup
-            eprintln!("default -> popup");
-            todo!("popup not implemented yet")
+            eprintln!("No subcommand given. Use `kiri popup` or `kiri listen`.");
+            Ok(())
         }
     }
 }
