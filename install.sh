@@ -109,8 +109,20 @@ install_system_deps() {
             elif command -v dnf &>/dev/null; then
                 info "Installing system deps via dnf..."
                 sudo dnf install -y git gtk4-devel libadwaita-devel portaudio-devel
+            elif command -v zypper &>/dev/null; then
+                info "Installing system deps via zypper..."
+                sudo zypper install -y git gtk4-devel libadwaita-devel portaudio-devel
+            elif command -v apk &>/dev/null; then
+                info "Installing system deps via apk..."
+                sudo apk add git gtk4.0-dev libadwaita-dev portaudio-dev
+            elif command -v xbps-install &>/dev/null; then
+                info "Installing system deps via xbps..."
+                sudo xbps-install -Sy git gtk4-devel libadwaita-devel portaudio-devel
+            elif command -v emerge &>/dev/null; then
+                info "Installing system deps via portage..."
+                sudo emerge --noreplace dev-vcs/git gui-libs/gtk:4 gui-libs/libadwaita media-libs/portaudio
             else
-                warn "Unknown package manager. Please install manually: gtk4, libadwaita, portaudio"
+                warn "Unknown package manager. Please install manually: git, gtk4, libadwaita, portaudio"
             fi
             ;;
     esac
