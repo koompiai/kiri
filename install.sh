@@ -97,18 +97,18 @@ install_system_deps() {
                 exit 1
             fi
             info "Installing system deps via Homebrew..."
-            brew install gtk4 libadwaita portaudio
+            brew install git gtk4 libadwaita portaudio
             ;;
         linux)
             if command -v pacman &>/dev/null; then
                 info "Installing system deps via pacman..."
-                sudo pacman -S --needed gtk4 libadwaita portaudio
+                sudo pacman -S --needed git gtk4 libadwaita portaudio
             elif command -v apt &>/dev/null; then
                 info "Installing system deps via apt..."
-                sudo apt install -y libgtk-4-dev libadwaita-1-dev portaudio19-dev
+                sudo apt install -y git libgtk-4-dev libadwaita-1-dev portaudio19-dev
             elif command -v dnf &>/dev/null; then
                 info "Installing system deps via dnf..."
-                sudo dnf install -y gtk4-devel libadwaita-devel portaudio-devel
+                sudo dnf install -y git gtk4-devel libadwaita-devel portaudio-devel
             else
                 warn "Unknown package manager. Please install manually: gtk4, libadwaita, portaudio"
             fi
