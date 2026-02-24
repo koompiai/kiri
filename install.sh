@@ -7,7 +7,7 @@ set -euo pipefail
 REPO="https://github.com/koompiai/kiri.git"
 APP_DIR="$HOME/.local/share/kiri/app"
 BIN_DIR="$HOME/.local/bin"
-CMDS=(kiri kiri-popup kiri-sync)
+CMDS=(kiri)
 
 # ── Colors ──────────────────────────────────────────────────────────────────
 
@@ -26,12 +26,10 @@ uninstall() {
     bold "Uninstalling Kiri..."; echo
     echo
 
-    for cmd in "${CMDS[@]}"; do
-        if [ -L "$BIN_DIR/$cmd" ]; then
-            rm "$BIN_DIR/$cmd"
-            info "Removed $BIN_DIR/$cmd"
-        fi
-    done
+    if [ -f "$BIN_DIR/kiri" ]; then
+        rm "$BIN_DIR/kiri"
+        info "Removed $BIN_DIR/kiri"
+    fi
 
     if [ -d "$APP_DIR" ]; then
         rm -rf "$APP_DIR"
@@ -86,15 +84,15 @@ echo
 bold "Installing Kiri ($PLATFORM)"; echo
 echo
 
-# ── Install uv ──────────────────────────────────────────────────────────────
+# ── Install Rust toolchain ─────────────────────────────────────────────────
 
-if command -v uv &>/dev/null; then
-    info "uv already installed ($(uv --version))"
+if command -v cargo &>/dev/null; then
+    info "Rust toolchain found ($(rustc --version))"
 else
-    info "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-    info "uv installed ($(uv --version))"
+    info "Installing Rust toolchain..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source "$HOME/.cargo/env"
+    info "Rust installed ($(rustc --version))"
 fi
 
 # ── Install system dependencies ─────────────────────────────────────────────
@@ -107,32 +105,32 @@ install_system_deps() {
                 exit 1
             fi
             info "Installing system deps via Homebrew..."
-            brew install git gtk4 libadwaita portaudio
+            brew install git cmake gtk4 libadwaita wl-clipboard ydotool
             ;;
         linux)
             if command -v pacman &>/dev/null; then
                 info "Installing system deps via pacman..."
-                sudo pacman -S --needed git gtk4 libadwaita gtk4-layer-shell portaudio
+                sudo pacman -S --needed git cmake base-devel gtk4 libadwaita gtk4-layer-shell alsa-lib wl-clipboard ydotool
             elif command -v apt &>/dev/null; then
                 info "Installing system deps via apt..."
-                sudo apt install -y git libgtk-4-dev libadwaita-1-dev libgtk-4-layer-shell-dev portaudio19-dev
+                sudo apt install -y git cmake build-essential libgtk-4-dev libadwaita-1-dev libgtk-4-layer-shell-dev libasound2-dev wl-clipboard ydotool
             elif command -v dnf &>/dev/null; then
                 info "Installing system deps via dnf..."
-                sudo dnf install -y git gtk4-devel libadwaita-devel gtk4-layer-shell-devel portaudio-devel
+                sudo dnf install -y git cmake gcc-c++ gtk4-devel libadwaita-devel gtk4-layer-shell-devel alsa-lib-devel wl-clipboard ydotool
             elif command -v zypper &>/dev/null; then
                 info "Installing system deps via zypper..."
-                sudo zypper install -y git gtk4-devel libadwaita-devel portaudio-devel
+                sudo zypper install -y git cmake gcc-c++ gtk4-devel libadwaita-devel wl-clipboard ydotool
             elif command -v apk &>/dev/null; then
                 info "Installing system deps via apk..."
-                sudo apk add git gtk4.0-dev libadwaita-dev portaudio-dev
+                sudo apk add git cmake build-base gtk4.0-dev libadwaita-dev alsa-lib-dev wl-clipboard ydotool
             elif command -v xbps-install &>/dev/null; then
                 info "Installing system deps via xbps..."
-                sudo xbps-install -Sy git gtk4-devel libadwaita-devel portaudio-devel
+                sudo xbps-install -Sy git cmake base-devel gtk4-devel libadwaita-devel alsa-lib-devel wl-clipboard ydotool
             elif command -v emerge &>/dev/null; then
                 info "Installing system deps via portage..."
-                sudo emerge --noreplace dev-vcs/git gui-libs/gtk:4 gui-libs/libadwaita media-libs/portaudio
+                sudo emerge --noreplace dev-vcs/git dev-util/cmake gui-libs/gtk:4 gui-libs/libadwaita media-libs/alsa-lib x11-misc/wl-clipboard app-misc/ydotool
             else
-                warn "Unknown package manager. Please install manually: git, gtk4, libadwaita, portaudio"
+                warn "Unknown package manager. Please install manually: git, cmake, gtk4, libadwaita, alsa-lib, wl-clipboard, ydotool"
             fi
             ;;
     esac
@@ -160,25 +158,43 @@ else
     git clone "$REPO" "$APP_DIR"
 fi
 
-# ── uv sync ─────────────────────────────────────────────────────────────────
+# ── Build ──────────────────────────────────────────────────────────────────
 
-info "Installing Python dependencies..."
+info "Building kiri (release)..."
 cd "$APP_DIR"
-uv sync
+cargo build --release
 
-# ── Create wrapper scripts ──────────────────────────────────────────────────
+# ── Install binary ─────────────────────────────────────────────────────────
 
 mkdir -p "$BIN_DIR"
-VENV_BIN="$APP_DIR/.venv/bin"
+cp "$APP_DIR/target/release/kiri" "$BIN_DIR/kiri"
+chmod +x "$BIN_DIR/kiri"
+info "Installed $BIN_DIR/kiri"
 
-for cmd in "${CMDS[@]}"; do
-    cat > "$BIN_DIR/$cmd" <<WRAPPER
-#!/bin/sh
-exec "$VENV_BIN/$cmd" "\$@"
-WRAPPER
-    chmod +x "$BIN_DIR/$cmd"
-    info "Created $BIN_DIR/$cmd"
-done
+# ── Download whisper model ─────────────────────────────────────────────────
+
+MODEL_DIR="$HOME/.local/share/kiri/models"
+MODEL_FILE="$MODEL_DIR/ggml-medium.bin"
+
+if [ -f "$MODEL_FILE" ]; then
+    info "Whisper model already downloaded"
+else
+    echo
+    printf "  Download Whisper medium model (~1.5GB)? [Y/n] "
+    if [ -t 0 ]; then
+        read -r answer
+    else
+        answer="y"
+        echo "y (non-interactive)"
+    fi
+    if [ "$answer" != "n" ] && [ "$answer" != "N" ]; then
+        mkdir -p "$MODEL_DIR"
+        info "Downloading ggml-medium.bin..."
+        curl -L -o "$MODEL_FILE" \
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
+        info "Model downloaded to $MODEL_FILE"
+    fi
+fi
 
 # ── PATH check ──────────────────────────────────────────────────────────────
 
@@ -211,7 +227,7 @@ Description=Kiri model sync
 
 [Service]
 Type=oneshot
-ExecStart=$VENV_BIN/kiri-sync
+ExecStart=$BIN_DIR/kiri sync
 EOF
 
         cat > "$UNIT_DIR/kiri-sync.timer" <<EOF
@@ -236,7 +252,7 @@ fi
 
 if [ -n "${KDE_SESSION_VERSION:-}" ] && command -v kwriteconfig6 &>/dev/null; then
     echo
-    printf "  Bind AI key (Copilot key) to kiri-popup? [y/N] "
+    printf "  Bind AI key (Copilot key) to kiri popup? [y/N] "
     if [ -t 0 ]; then
         read -r answer
     else
@@ -251,7 +267,7 @@ if [ -n "${KDE_SESSION_VERSION:-}" ] && command -v kwriteconfig6 &>/dev/null; th
 [Desktop Entry]
 Name=Kiri Voice Popup
 Comment=Voice-to-text assistant
-Exec=$BIN_DIR/kiri-popup
+Exec=$BIN_DIR/kiri popup
 Icon=audio-input-microphone
 Type=Application
 Categories=Utility;AudioVideo;
@@ -266,7 +282,7 @@ DESKTOP
             --group "kiri-popup.desktop" \
             --key "_k_friendly_name" "Kiri Voice Popup"
 
-        info "AI key bound to kiri-popup (log out/in to activate)"
+        info "AI key bound to kiri popup (log out/in to activate)"
     fi
 fi
 
@@ -276,13 +292,9 @@ echo
 bold "Kiri installed successfully!"; echo
 echo
 echo "  Usage:"
-echo "    kiri                  — transcribe from microphone"
-echo "    kiri-popup            — GUI popup recorder"
-echo "    kiri-sync             — download/update whisper models"
-echo "    kiri --check          — verify setup"
-echo
-echo "  First run:"
-echo "    kiri-sync             — download the default model"
+echo "    kiri popup            — voice popup (default)"
+echo "    kiri listen           — CLI transcription"
+echo "    kiri sync             — notes git status"
 echo
 echo "  Uninstall:"
 echo "    curl -fsSL https://raw.githubusercontent.com/koompiai/kiri/main/install.sh | bash -s -- --uninstall"
