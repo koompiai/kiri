@@ -1,18 +1,4 @@
-# Python
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-# Models (stored in ~/.local/share/kiri/models/)
-whisper-*-ov/
-
-
-# Added by cargo
-
 /target
+*.swp
+*.swo
+.DS_Store
