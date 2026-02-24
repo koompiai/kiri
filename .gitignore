@@ -11,3 +11,8 @@ wheels/
 
 # Models (stored in ~/.local/share/kiri/models/)
 whisper-*-ov/
+
+
+# Added by cargo
+
+/target

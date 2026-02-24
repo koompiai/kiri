@@ -1,0 +1,21 @@
+[package]
+name = "kiri"
+version = "0.1.0"
+edition = "2024"
+description = "Kiri — voice-to-text assistant"
+
+[[bin]]
+name = "kiri"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+gtk4 = "0.10"
+gtk4-layer-shell = "0.7"
+cpal = "0.17"
+rubato = "1.0"
+whisper-rs = "0.15"
+wl-clipboard-rs = "0.9"
+anyhow = "1"
+dirs = "6"
+chrono = "0.4"
