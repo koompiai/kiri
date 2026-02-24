@@ -1,5 +1,6 @@
 mod audio;
 mod config;
+mod output;
 mod transcribe;
 
 use clap::{Parser, Subcommand};
