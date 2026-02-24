@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod output;
 mod transcribe;
+mod ui;
 
 use clap::{Parser, Subcommand};
 
@@ -37,8 +38,11 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Popup { lang }) => {
-            eprintln!("popup: lang={lang}, model={:?}", cli.model);
-            todo!("popup not implemented yet")
+            let model_path = cli
+                .model
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| config::default_model_path());
+            ui::popup::run_popup(lang, model_path)
         }
         Some(Commands::Listen { lang, duration: _ }) => {
             let model_path = cli
@@ -76,8 +80,11 @@ fn main() -> anyhow::Result<()> {
             todo!("sync not implemented yet")
         }
         None => {
-            eprintln!("No subcommand given. Use `kiri popup` or `kiri listen`.");
-            Ok(())
+            let model_path = cli
+                .model
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| config::default_model_path());
+            ui::popup::run_popup("en".to_string(), model_path)
         }
     }
 }
