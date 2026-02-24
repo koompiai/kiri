@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Models (stored in ~/.local/share/kiri/models/)
+whisper-*-ov/

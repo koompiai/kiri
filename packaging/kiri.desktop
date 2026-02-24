@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Kiri
+Comment=Voice-to-text assistant
+Exec=kiri-popup
+Icon=audio-input-microphone
+Categories=AudioVideo;Audio;Utility;
+Keywords=voice;speech;transcription;whisper;
+StartupNotify=false
+Terminal=false
