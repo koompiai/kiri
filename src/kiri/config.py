@@ -1,11 +1,16 @@
 """Kiri configuration — paths and audio constants."""
 
+import sys
 from pathlib import Path
 
 # ── XDG-style paths ──────────────────────────────────────────────────────────
 
 NOTES_DIR = Path.home() / "kiri"
-MODELS_DIR = Path.home() / ".local" / "share" / "kiri" / "models"
+
+if sys.platform == "darwin":
+    MODELS_DIR = Path.home() / "Library" / "Application Support" / "kiri" / "models"
+else:
+    MODELS_DIR = Path.home() / ".local" / "share" / "kiri" / "models"
 
 # ── Audio ────────────────────────────────────────────────────────────────────
 
@@ -13,7 +18,7 @@ RECORD_RATE = 48000    # what the mic actually supports
 WHISPER_RATE = 16000   # what Whisper expects
 CHANNELS = 1
 DTYPE = "int16"
-MIC_HW = "hw:0,10"    # ALSA hardware name for the mic
+MIC_HW = None          # None = auto-detect default input device
 
 # ── Model defaults ───────────────────────────────────────────────────────────
 
