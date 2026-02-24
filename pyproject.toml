@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 kiri = "kiri.cli.main:main"
 kiri-popup = "kiri.cli.gui_main:main"
+kiri-sync = "kiri.cli.sync_main:main"
 
 [build-system]
 requires = ["hatchling"]

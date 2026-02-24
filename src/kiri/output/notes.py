@@ -24,4 +24,9 @@ def save_to_notes(text: str, filename: str | None = None) -> Path:
             f.write(f"# {filepath.stem}\n\n")
         f.write(f"<!-- {timestamp} -->\n{text}\n\n")
 
+    # Auto-commit if notes dir is a git repo
+    from kiri.sync import commit_notes, is_notes_repo
+    if is_notes_repo():
+        commit_notes()
+
     return filepath

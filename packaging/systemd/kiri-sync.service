@@ -1,0 +1,11 @@
+[Unit]
+Description=Kiri notes sync — commit and push to GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/kiri-sync --push
+
+[Install]
+WantedBy=default.target
