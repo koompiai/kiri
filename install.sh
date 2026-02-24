@@ -47,6 +47,16 @@ uninstall() {
         info "Removed systemd timer"
     fi
 
+    # KDE shortcut + desktop entry
+    if [ -f "$HOME/.local/share/applications/kiri-popup.desktop" ]; then
+        rm -f "$HOME/.local/share/applications/kiri-popup.desktop"
+        info "Removed desktop entry"
+    fi
+    if command -v kwriteconfig6 &>/dev/null; then
+        kwriteconfig6 --file kglobalshortcutsrc --group "kiri-popup.desktop" --key "_launch" --delete 2>/dev/null || true
+        kwriteconfig6 --file kglobalshortcutsrc --group "kiri-popup.desktop" --key "_k_friendly_name" --delete 2>/dev/null || true
+    fi
+
     echo
     info "Uninstall complete. Notes in ~/kiri/ and models were kept."
     echo
@@ -219,6 +229,44 @@ EOF
         systemctl --user daemon-reload
         systemctl --user enable --now kiri-sync.timer
         info "Systemd timer enabled (daily sync)"
+    fi
+fi
+
+# ── KDE: offer AI key binding ────────────────────────────────────────────────
+
+if [ -n "${KDE_SESSION_VERSION:-}" ] && command -v kwriteconfig6 &>/dev/null; then
+    echo
+    printf "  Bind AI key (Copilot key) to kiri-popup? [y/N] "
+    if [ -t 0 ]; then
+        read -r answer
+    else
+        answer="n"
+        echo "n (non-interactive)"
+    fi
+
+    if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+        # Desktop entry
+        mkdir -p "$HOME/.local/share/applications"
+        cat > "$HOME/.local/share/applications/kiri-popup.desktop" <<DESKTOP
+[Desktop Entry]
+Name=Kiri Voice Popup
+Comment=Voice-to-text assistant
+Exec=$BIN_DIR/kiri-popup
+Icon=audio-input-microphone
+Type=Application
+Categories=Utility;AudioVideo;
+Keywords=voice;transcribe;whisper;
+DESKTOP
+
+        # KDE global shortcut: Shift+Meta+F23 (AI/Copilot key)
+        kwriteconfig6 --file kglobalshortcutsrc \
+            --group "kiri-popup.desktop" \
+            --key "_launch" "Shift+Meta+F23,none,Kiri Voice Popup"
+        kwriteconfig6 --file kglobalshortcutsrc \
+            --group "kiri-popup.desktop" \
+            --key "_k_friendly_name" "Kiri Voice Popup"
+
+        info "AI key bound to kiri-popup (log out/in to activate)"
     fi
 fi
 
