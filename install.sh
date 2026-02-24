@@ -179,21 +179,11 @@ MODEL_FILE="$MODEL_DIR/ggml-medium.bin"
 if [ -f "$MODEL_FILE" ]; then
     info "Whisper model already downloaded"
 else
-    echo
-    printf "  Download Whisper medium model (~1.5GB)? [Y/n] "
-    if [ -t 0 ]; then
-        read -r answer
-    else
-        answer="y"
-        echo "y (non-interactive)"
-    fi
-    if [ "$answer" != "n" ] && [ "$answer" != "N" ]; then
-        mkdir -p "$MODEL_DIR"
-        info "Downloading ggml-medium.bin..."
-        curl -L -o "$MODEL_FILE" \
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
-        info "Model downloaded to $MODEL_FILE"
-    fi
+    mkdir -p "$MODEL_DIR"
+    info "Downloading Whisper medium model (~1.5GB)..."
+    curl -L --progress-bar -o "$MODEL_FILE" \
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
+    info "Model downloaded to $MODEL_FILE"
 fi
 
 # ── PATH check ──────────────────────────────────────────────────────────────
