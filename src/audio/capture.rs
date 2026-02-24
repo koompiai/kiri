@@ -21,12 +21,34 @@ impl AudioCapture {
         }
     }
 
+    /// Get a clone of the stop flag for external control.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
 
+    /// Reset the stop flag so the capture can be reused for another chunk.
+    pub fn reset(&self) {
+        self.stop.store(false, Ordering::Relaxed);
+        self.frames.lock().unwrap().clear();
+    }
+
     /// Record until silence is detected after speech. Returns 48kHz f32 audio.
+    /// Uses default SILENCE_DURATION.
     pub fn record_with_silence(&self) -> anyhow::Result<Vec<f32>> {
+        self.record_with_silence_opts(SILENCE_DURATION)
+    }
+
+    /// Record with configurable silence detection.
+    ///
+    /// - `silence_duration` — seconds of silence after speech to stop recording
+    pub fn record_with_silence_opts(
+        &self,
+        silence_duration: f32,
+    ) -> anyhow::Result<Vec<f32>> {
         self.stop.store(false, Ordering::Relaxed);
         self.frames.lock().unwrap().clear();
 
@@ -75,7 +97,7 @@ impl AudioCapture {
                     if silence_start.is_none() {
                         silence_start = Some(now);
                     } else if let Some(start) = silence_start {
-                        if now.duration_since(start).as_secs_f32() >= SILENCE_DURATION {
+                        if now.duration_since(start).as_secs_f32() >= silence_duration {
                             stop.store(true, Ordering::Relaxed);
                         }
                     }

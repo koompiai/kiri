@@ -1,8 +1,9 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
 use gtk4::{self as gtk, gdk, glib, Application, ApplicationWindow, CssProvider, Label};
@@ -11,12 +12,17 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use super::states::State;
 use super::styles::CSS;
 
+/// Short silence duration for chunk boundaries in streaming mode.
+const CHUNK_SILENCE: f32 = 1.0;
+
 /// Messages sent from the background thread to the GTK main thread.
 enum StateMsg {
     SetState(State),
     SetResult(String),
-    #[allow(dead_code)]
     SetError(String),
+    AudioLevel(f32),
+    PartialText(String),
+    PasteText(String),
     Quit,
 }
 
@@ -31,6 +37,9 @@ struct PopupWidgets {
     stop_btn: gtk::Button,
     state: Cell<State>,
     pulse_phase: Cell<f64>,
+    audio_level: Cell<f32>,
+    has_speech: Cell<bool>,
+    last_speech_time: Cell<f64>,
 }
 
 pub fn run_popup(lang: String, model_path: PathBuf) -> anyhow::Result<()> {
@@ -48,7 +57,7 @@ pub fn run_popup(lang: String, model_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_ui(app: &Application, _lang: String, _model_path: PathBuf) {
+fn build_ui(app: &Application, lang: String, model_path: PathBuf) {
     // --- CSS ---
     let provider = CssProvider::new();
     provider.load_from_data(CSS);
@@ -149,15 +158,21 @@ fn build_ui(app: &Application, _lang: String, _model_path: PathBuf) {
         stop_btn: stop_btn.clone(),
         state: Cell::new(State::Loading),
         pulse_phase: Cell::new(0.0),
+        audio_level: Cell::new(0.0),
+        has_speech: Cell::new(false),
+        last_speech_time: Cell::new(0.0),
     });
+
+    // --- Stop flag shared between UI and background thread ---
+    let stop_flag = Arc::new(AtomicBool::new(false));
 
     // --- Escape key handler ---
     let key_ctrl = gtk::EventControllerKey::new();
     {
-        let app = app.clone();
+        let stop = stop_flag.clone();
         key_ctrl.connect_key_pressed(move |_ctrl, keyval, _keycode, _modifier| {
             if keyval == gdk::Key::Escape {
-                app.quit();
+                stop.store(true, Ordering::Relaxed);
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
@@ -168,20 +183,20 @@ fn build_ui(app: &Application, _lang: String, _model_path: PathBuf) {
 
     // --- Stop button handler ---
     {
-        let app = app.clone();
+        let stop = stop_flag.clone();
         stop_btn.connect_clicked(move |_| {
-            app.quit();
+            stop.store(true, Ordering::Relaxed);
         });
     }
 
     // --- Background thread communication ---
-    // Use std::sync::mpsc; the pulse timer polls for messages on the GTK thread.
     let (tx, rx) = mpsc::channel::<StateMsg>();
 
-    // --- Pulse timer (80ms) — also drains the message channel ---
+    // --- Pulse timer (80ms) -- also drains the message channel ---
     {
         let w = Rc::clone(&widgets);
         let app = app.clone();
+        let epoch = Instant::now();
         glib::timeout_add_local(Duration::from_millis(80), move || {
             // Drain pending messages from background thread
             while let Ok(msg) = rx.try_recv() {
@@ -189,6 +204,24 @@ fn build_ui(app: &Application, _lang: String, _model_path: PathBuf) {
                     StateMsg::SetState(state) => apply_state(&w, state, None),
                     StateMsg::SetResult(text) => apply_state(&w, State::Result, Some(&text)),
                     StateMsg::SetError(text) => apply_state(&w, State::Error, Some(&text)),
+                    StateMsg::AudioLevel(level) => {
+                        w.audio_level.set(level);
+                        if level > crate::config::SILENCE_THRESHOLD {
+                            w.has_speech.set(true);
+                            w.last_speech_time.set(epoch.elapsed().as_secs_f64());
+                        }
+                    }
+                    StateMsg::PasteText(text) => {
+                        let _ = crate::output::typer::paste_text(&format!("{text} "));
+                    }
+                    StateMsg::PartialText(text) => {
+                        let display = if text.len() > 100 {
+                            format!("\u{2026}{}", &text[text.len() - 99..])
+                        } else {
+                            text
+                        };
+                        w.info_label.set_text(&display);
+                    }
                     StateMsg::Quit => {
                         app.quit();
                         return glib::ControlFlow::Break;
@@ -202,9 +235,24 @@ fn build_ui(app: &Application, _lang: String, _model_path: PathBuf) {
 
             match w.state.get() {
                 State::Listening => {
-                    // Simulate a gentle pulse for the level bar (real audio level comes in Task 7)
-                    let pulse_width = ((phase.sin() + 1.0) / 2.0 * 140.0) as i32;
-                    w.level_fill.set_size_request(pulse_width, 8);
+                    // Real audio level drives the bar
+                    let level = w.audio_level.get();
+                    let bar_width = (level.min(0.15) / 0.15 * 280.0) as i32;
+                    w.level_fill.set_size_request(bar_width.max(2), 8);
+
+                    // Show "Done in Xs" countdown after speech detected
+                    if w.has_speech.get() {
+                        let now = epoch.elapsed().as_secs_f64();
+                        let elapsed_since_speech = now - w.last_speech_time.get();
+                        let remaining =
+                            (crate::config::DONE_TIMEOUT as f64 - elapsed_since_speech).max(0.0);
+                        if remaining > 0.0 {
+                            w.hint
+                                .set_text(&format!("Done in {:.0}s...", remaining.ceil()));
+                        } else {
+                            w.hint.set_text("Finishing...");
+                        }
+                    }
                 }
                 State::Transcribing => {
                     let dots = ".".repeat((phase as usize) % 4);
@@ -219,18 +267,205 @@ fn build_ui(app: &Application, _lang: String, _model_path: PathBuf) {
 
     win.present();
 
-    // --- Dummy background thread (proves UI works end-to-end) ---
-    std::thread::spawn(move || {
-        // Simulate: Loading (2s) -> Listening (5s) -> Result (3s) -> quit
-        std::thread::sleep(Duration::from_secs(2));
-        let _ = tx.send(StateMsg::SetState(State::Listening));
+    // --- Background thread: real streaming transcription ---
+    {
+        let stop = stop_flag.clone();
+        std::thread::spawn(move || {
+            streaming_transcription(tx, stop, lang, model_path);
+        });
+    }
+}
 
-        std::thread::sleep(Duration::from_secs(5));
-        let _ = tx.send(StateMsg::SetResult("Test transcription text".to_string()));
+/// Background thread: load model, capture audio in chunks, transcribe, paste.
+fn streaming_transcription(
+    tx: mpsc::Sender<StateMsg>,
+    stop: Arc<AtomicBool>,
+    lang: String,
+    model_path: PathBuf,
+) {
+    // Helper to send and bail on closed channel
+    macro_rules! send {
+        ($msg:expr) => {
+            if tx.send($msg).is_err() {
+                return; // UI closed
+            }
+        };
+    }
 
-        std::thread::sleep(Duration::from_secs(3));
-        let _ = tx.send(StateMsg::Quit);
-    });
+    // --- Load whisper model ---
+    let engine = match crate::transcribe::whisper::WhisperEngine::load(&model_path) {
+        Ok(e) => e,
+        Err(e) => {
+            send!(StateMsg::SetError(format!("Model load failed: {e}")));
+            std::thread::sleep(Duration::from_secs(3));
+            send!(StateMsg::Quit);
+            return;
+        }
+    };
+
+    send!(StateMsg::SetState(State::Listening));
+
+    let capture = crate::audio::capture::AudioCapture::new();
+    let capture_stop = capture.stop_flag();
+    let audio_level = capture.audio_level.clone();
+
+    let mut accumulated_text = String::new();
+    let mut had_speech = false;
+    let mut last_speech_time = Instant::now();
+
+    // --- Chunk loop ---
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Spawn a watcher that propagates the UI stop flag to AudioCapture
+        // so record_with_silence_opts unblocks promptly when user hits Stop/Escape.
+        let chunk_done = Arc::new(AtomicBool::new(false));
+        {
+            let stop = stop.clone();
+            let capture_stop = capture_stop.clone();
+            let chunk_done = chunk_done.clone();
+            std::thread::spawn(move || {
+                loop {
+                    if chunk_done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        capture_stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+        }
+
+        // Spawn a level reporter that sends audio levels to the UI
+        {
+            let audio_level = audio_level.clone();
+            let tx = tx.clone();
+            let chunk_done = chunk_done.clone();
+            std::thread::spawn(move || {
+                loop {
+                    if chunk_done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let level = *audio_level.lock().unwrap();
+                    let _ = tx.send(StateMsg::AudioLevel(level));
+                    std::thread::sleep(Duration::from_millis(60));
+                }
+            });
+        }
+
+        // Record one chunk with short silence boundary
+        let raw_audio = match capture.record_with_silence_opts(CHUNK_SILENCE) {
+            Ok(audio) => audio,
+            Err(e) => {
+                chunk_done.store(true, Ordering::Relaxed);
+                send!(StateMsg::SetError(format!("Audio error: {e}")));
+                std::thread::sleep(Duration::from_secs(3));
+                send!(StateMsg::Quit);
+                return;
+            }
+        };
+
+        // Signal helper threads to exit
+        chunk_done.store(true, Ordering::Relaxed);
+
+        // If user requested stop, break immediately
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Check if chunk has meaningful audio (at least 0.3s at 48kHz)
+        let min_samples = (crate::config::RECORD_RATE as f32 * 0.3) as usize;
+        if raw_audio.len() < min_samples {
+            if had_speech {
+                // Had speech before but this chunk was too short -- session done
+                break;
+            }
+            continue;
+        }
+
+        // Check done timeout: if we had speech and it's been too long since last text
+        if had_speech
+            && last_speech_time.elapsed().as_secs_f32() >= crate::config::DONE_TIMEOUT
+        {
+            break;
+        }
+
+        // Resample 48k -> 16k
+        send!(StateMsg::SetState(State::Transcribing));
+        let audio_16k = crate::audio::resample::resample_48k_to_16k(&raw_audio);
+
+        // Transcribe
+        let text = match engine.transcribe(&audio_16k, &lang) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Transcription error: {e}");
+                send!(StateMsg::SetState(State::Listening));
+                continue;
+            }
+        };
+
+        send!(StateMsg::SetState(State::Listening));
+
+        // Skip empty or hallucinated results
+        let text = text.trim().to_string();
+        if text.is_empty() || is_hallucination(&text) {
+            if had_speech
+                && last_speech_time.elapsed().as_secs_f32() >= crate::config::DONE_TIMEOUT
+            {
+                break;
+            }
+            continue;
+        }
+
+        // We got real text
+        had_speech = true;
+        last_speech_time = Instant::now();
+
+        // Paste this chunk into the active app
+        send!(StateMsg::PasteText(text.clone()));
+
+        // Update accumulated display
+        if !accumulated_text.is_empty() {
+            accumulated_text.push(' ');
+        }
+        accumulated_text.push_str(&text);
+        send!(StateMsg::PartialText(accumulated_text.clone()));
+    }
+
+    // Session complete
+    if accumulated_text.is_empty() {
+        send!(StateMsg::SetResult("No speech detected".to_string()));
+    } else {
+        send!(StateMsg::SetResult(accumulated_text));
+    }
+
+    std::thread::sleep(Duration::from_millis(1500));
+    send!(StateMsg::Quit);
+}
+
+/// Detect common whisper hallucinations (empty/repeated noise artifacts).
+fn is_hallucination(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    let hallucinations = [
+        "you",
+        "thank you.",
+        "thanks for watching!",
+        "thank you for watching!",
+        "subscribe",
+        "like and subscribe",
+        "(silence)",
+        "[silence]",
+        "...",
+        "the end.",
+        "bye.",
+    ];
+    hallucinations.iter().any(|h| t == *h)
+        || t.chars().all(|c| c == '.' || c == ' ')
+        || t.len() < 2
 }
 
 fn apply_state(w: &PopupWidgets, state: State, text: Option<&str>) {
