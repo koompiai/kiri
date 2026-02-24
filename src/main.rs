@@ -1,6 +1,7 @@
 mod audio;
 mod config;
 mod output;
+mod sync;
 mod transcribe;
 mod ui;
 
@@ -76,8 +77,8 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Commands::Sync) => {
-            eprintln!("sync");
-            todo!("sync not implemented yet")
+            println!("{}", sync::status());
+            Ok(())
         }
         None => {
             let model_path = cli
