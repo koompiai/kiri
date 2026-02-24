@@ -12,7 +12,7 @@ def main():
                         help="Language: en or km (default: en)")
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL,
                         help=f"Model directory (default: {DEFAULT_MODEL})")
-    parser.add_argument("--device", default="GPU", choices=["GPU", "CPU"],
+    parser.add_argument("--device", default="GPU", choices=["GPU", "CPU", "NPU"],
                         help="OpenVINO device (default: GPU)")
     args = parser.parse_args()
 

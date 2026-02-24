@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--clipboard", action="store_true",
                         help="Copy to clipboard instead of saving to file")
     parser.add_argument("--device", default="GPU",
-                        choices=["GPU", "CPU"],
+                        choices=["GPU", "CPU", "NPU"],
                         help="OpenVINO device (default: GPU)")
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL,
                         help=f"Model directory name (default: {DEFAULT_MODEL})")
