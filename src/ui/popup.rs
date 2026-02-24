@@ -12,8 +12,13 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use super::states::State;
 use super::styles::CSS;
 
-/// Short silence duration for chunk boundaries in streaming mode.
-const CHUNK_SILENCE: f32 = 1.0;
+/// Seconds between partial transcription attempts during speech.
+const STREAM_INTERVAL: f32 = 4.0;
+/// Seconds of silence after speech to finalize a segment and paste.
+/// Longer = more context for whisper = better accuracy.
+const SEGMENT_SILENCE: f32 = 2.0;
+/// Minimum audio duration worth transcribing (seconds).
+const MIN_SEGMENT: f32 = 0.5;
 
 /// Messages sent from the background thread to the GTK main thread.
 enum StateMsg {
@@ -23,6 +28,7 @@ enum StateMsg {
     AudioLevel(f32),
     PartialText(String),
     PasteText(String),
+    NoteSaved(String),
     Quit,
 }
 
@@ -40,15 +46,16 @@ struct PopupWidgets {
     audio_level: Cell<f32>,
     has_speech: Cell<bool>,
     last_speech_time: Cell<f64>,
+    note_mode: bool,
 }
 
-pub fn run_popup(lang: String, model_path: PathBuf) -> anyhow::Result<()> {
+pub fn run_popup(lang: String, model_path: PathBuf, note_mode: bool) -> anyhow::Result<()> {
     let app = Application::builder()
         .application_id("com.kiri.popup")
         .build();
 
     app.connect_activate(move |app| {
-        build_ui(app, lang.clone(), model_path.clone());
+        build_ui(app, lang.clone(), model_path.clone(), note_mode);
     });
 
     // GTK application expects &[&str] args; pass empty since we use clap.
@@ -57,7 +64,7 @@ pub fn run_popup(lang: String, model_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_ui(app: &Application, lang: String, model_path: PathBuf) {
+fn build_ui(app: &Application, lang: String, model_path: PathBuf, note_mode: bool) {
     // --- CSS ---
     let provider = CssProvider::new();
     provider.load_from_data(CSS);
@@ -104,7 +111,12 @@ fn build_ui(app: &Application, lang: String, model_path: PathBuf) {
     dot.add_css_class("dot-loading");
     left.append(&dot);
 
-    let status_label = Label::new(Some("Loading model..."));
+    let loading_text = if note_mode {
+        "Loading (private note)..."
+    } else {
+        "Loading model..."
+    };
+    let status_label = Label::new(Some(loading_text));
     status_label.add_css_class("status-label");
     left.append(&status_label);
 
@@ -161,6 +173,7 @@ fn build_ui(app: &Application, lang: String, model_path: PathBuf) {
         audio_level: Cell::new(0.0),
         has_speech: Cell::new(false),
         last_speech_time: Cell::new(0.0),
+        note_mode,
     });
 
     // --- Stop flag shared between UI and background thread ---
@@ -213,6 +226,9 @@ fn build_ui(app: &Application, lang: String, model_path: PathBuf) {
                     }
                     StateMsg::PasteText(text) => {
                         let _ = crate::output::typer::paste_text(&format!("{text} "));
+                    }
+                    StateMsg::NoteSaved(path) => {
+                        apply_state(&w, State::Result, Some(&format!("Saved to {path}")));
                     }
                     StateMsg::PartialText(text) => {
                         let display = if text.len() > 100 {
@@ -271,23 +287,29 @@ fn build_ui(app: &Application, lang: String, model_path: PathBuf) {
     {
         let stop = stop_flag.clone();
         std::thread::spawn(move || {
-            streaming_transcription(tx, stop, lang, model_path);
+            streaming_transcription(tx, stop, lang, model_path, note_mode);
         });
     }
 }
 
-/// Background thread: load model, capture audio in chunks, transcribe, paste.
+/// Background thread: continuous audio capture with periodic transcription.
+///
+/// Instead of recording chunk-by-chunk (wait for silence → transcribe → paste),
+/// this streams audio continuously and transcribes periodically:
+/// - Partial text shown every ~3s while speaking
+/// - Segment finalized and pasted after 1s silence
+/// - Session ends after 5s silence
 fn streaming_transcription(
     tx: mpsc::Sender<StateMsg>,
     stop: Arc<AtomicBool>,
     lang: String,
     model_path: PathBuf,
+    note_mode: bool,
 ) {
-    // Helper to send and bail on closed channel
     macro_rules! send {
         ($msg:expr) => {
             if tx.send($msg).is_err() {
-                return; // UI closed
+                return;
             }
         };
     }
@@ -306,139 +328,169 @@ fn streaming_transcription(
     send!(StateMsg::SetState(State::Listening));
 
     let capture = crate::audio::capture::AudioCapture::new();
-    let capture_stop = capture.stop_flag();
     let audio_level = capture.audio_level.clone();
 
-    let mut accumulated_text = String::new();
-    let mut had_speech = false;
-    let mut last_speech_time = Instant::now();
-
-    // --- Chunk loop ---
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            break;
+    // Start continuous audio stream
+    let _stream = match capture.start_stream() {
+        Ok(s) => s,
+        Err(e) => {
+            send!(StateMsg::SetError(format!("Audio error: {e}")));
+            std::thread::sleep(Duration::from_secs(3));
+            send!(StateMsg::Quit);
+            return;
         }
+    };
 
-        // Spawn a watcher that propagates the UI stop flag to AudioCapture
-        // so record_with_silence_opts unblocks promptly when user hits Stop/Escape.
-        let chunk_done = Arc::new(AtomicBool::new(false));
-        {
-            let stop = stop.clone();
-            let capture_stop = capture_stop.clone();
-            let chunk_done = chunk_done.clone();
-            std::thread::spawn(move || {
-                loop {
-                    if chunk_done.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if stop.load(Ordering::Relaxed) {
-                        capture_stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            });
-        }
-
-        // Spawn a level reporter that sends audio levels to the UI
-        {
-            let audio_level = audio_level.clone();
-            let tx = tx.clone();
-            let chunk_done = chunk_done.clone();
-            std::thread::spawn(move || {
-                loop {
-                    if chunk_done.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let level = *audio_level.lock().unwrap();
-                    let _ = tx.send(StateMsg::AudioLevel(level));
-                    std::thread::sleep(Duration::from_millis(60));
-                }
-            });
-        }
-
-        // Record one chunk with short silence boundary
-        let raw_audio = match capture.record_with_silence_opts(CHUNK_SILENCE) {
-            Ok(audio) => audio,
-            Err(e) => {
-                chunk_done.store(true, Ordering::Relaxed);
-                send!(StateMsg::SetError(format!("Audio error: {e}")));
-                std::thread::sleep(Duration::from_secs(3));
-                send!(StateMsg::Quit);
-                return;
+    // Level reporter: pumps audio levels to UI independently of transcription
+    let level_done = Arc::new(AtomicBool::new(false));
+    {
+        let audio_level = audio_level.clone();
+        let tx = tx.clone();
+        let done = level_done.clone();
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let level = *audio_level.lock().unwrap();
+                let _ = tx.send(StateMsg::AudioLevel(level));
+                std::thread::sleep(Duration::from_millis(60));
             }
-        };
-
-        // Signal helper threads to exit
-        chunk_done.store(true, Ordering::Relaxed);
-
-        // If user requested stop, break immediately
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-
-        // Check if chunk has meaningful audio (at least 0.3s at 48kHz)
-        let min_samples = (crate::config::RECORD_RATE as f32 * 0.3) as usize;
-        if raw_audio.len() < min_samples {
-            if had_speech {
-                // Had speech before but this chunk was too short -- session done
-                break;
-            }
-            continue;
-        }
-
-        // Check done timeout: if we had speech and it's been too long since last text
-        if had_speech
-            && last_speech_time.elapsed().as_secs_f32() >= crate::config::DONE_TIMEOUT
-        {
-            break;
-        }
-
-        // Resample 48k -> 16k
-        send!(StateMsg::SetState(State::Transcribing));
-        let audio_16k = crate::audio::resample::resample_48k_to_16k(&raw_audio);
-
-        // Transcribe
-        let text = match engine.transcribe(&audio_16k, &lang) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Transcription error: {e}");
-                send!(StateMsg::SetState(State::Listening));
-                continue;
-            }
-        };
-
-        send!(StateMsg::SetState(State::Listening));
-
-        // Skip empty or hallucinated results
-        let text = text.trim().to_string();
-        if text.is_empty() || is_hallucination(&text) {
-            if had_speech
-                && last_speech_time.elapsed().as_secs_f32() >= crate::config::DONE_TIMEOUT
-            {
-                break;
-            }
-            continue;
-        }
-
-        // We got real text
-        had_speech = true;
-        last_speech_time = Instant::now();
-
-        // Paste this chunk into the active app
-        send!(StateMsg::PasteText(text.clone()));
-
-        // Update accumulated display
-        if !accumulated_text.is_empty() {
-            accumulated_text.push(' ');
-        }
-        accumulated_text.push_str(&text);
-        send!(StateMsg::PartialText(accumulated_text.clone()));
+        });
     }
 
-    // Session complete
+    let mut accumulated_text = String::new();
+    let mut speech_onset: Option<Instant> = None;
+    let mut had_speech = false;
+    let mut last_speech_time: Option<Instant> = None;
+    let mut last_transcribe = Instant::now();
+    let mut new_speech = false;
+
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Track speech/silence from audio level
+        let level = capture.get_level();
+        let now = Instant::now();
+
+        if level > crate::config::SILENCE_THRESHOLD {
+            // Track onset — require sustained speech before considering it real
+            if speech_onset.is_none() {
+                speech_onset = Some(now);
+            }
+            if let Some(onset) = speech_onset {
+                if now.duration_since(onset).as_secs_f32()
+                    >= crate::config::SPEECH_MIN_DURATION
+                {
+                    last_speech_time = Some(now);
+                    had_speech = true;
+                    new_speech = true;
+                }
+            }
+        } else {
+            // Reset onset on silence — brief noise bursts don't count
+            speech_onset = None;
+        }
+
+        let silence_secs = last_speech_time
+            .map(|t| now.duration_since(t).as_secs_f32())
+            .unwrap_or(f32::MAX);
+
+        // End session on long silence after speech
+        if had_speech && silence_secs >= crate::config::DONE_TIMEOUT {
+            break;
+        }
+
+        let audio = capture.snapshot();
+        let duration = audio.len() as f32 / crate::config::RECORD_RATE as f32;
+
+        // Max duration safeguard
+        if duration >= crate::config::MAX_DURATION {
+            if duration >= MIN_SEGMENT {
+                send!(StateMsg::SetState(State::Transcribing));
+                let audio_16k = crate::audio::resample::resample_48k_to_16k(&audio);
+                if let Ok(text) = engine.transcribe(&audio_16k, &lang) {
+                    let text = text.trim().to_string();
+                    if !text.is_empty() && !is_hallucination(&text) {
+                        if !note_mode {
+                            send!(StateMsg::PasteText(text.clone()));
+                        }
+                        if !accumulated_text.is_empty() {
+                            accumulated_text.push(' ');
+                        }
+                        accumulated_text.push_str(&text);
+                    }
+                }
+            }
+            break;
+        }
+
+        // Finalize segment: silence detected after speech, enough audio
+        if had_speech && silence_secs >= SEGMENT_SILENCE && duration >= MIN_SEGMENT {
+            send!(StateMsg::SetState(State::Transcribing));
+            let audio_16k = crate::audio::resample::resample_48k_to_16k(&audio);
+            match engine.transcribe(&audio_16k, &lang) {
+                Ok(text) => {
+                    let text = text.trim().to_string();
+                    if !text.is_empty() && !is_hallucination(&text) {
+                        if !note_mode {
+                            send!(StateMsg::PasteText(text.clone()));
+                        }
+                        if !accumulated_text.is_empty() {
+                            accumulated_text.push(' ');
+                        }
+                        accumulated_text.push_str(&text);
+                        send!(StateMsg::PartialText(accumulated_text.clone()));
+                    }
+                }
+                Err(e) => eprintln!("Transcription error: {e}"),
+            }
+            capture.clear_buffer();
+            new_speech = false;
+            speech_onset = None;
+            last_transcribe = Instant::now();
+            send!(StateMsg::SetState(State::Listening));
+            continue;
+        }
+
+        // Periodic partial transcription while speaking (fast greedy for preview)
+        if new_speech
+            && duration >= 2.0
+            && last_transcribe.elapsed().as_secs_f32() >= STREAM_INTERVAL
+        {
+            let audio_16k = crate::audio::resample::resample_48k_to_16k(&audio);
+            match engine.transcribe_fast(&audio_16k, &lang) {
+                Ok(text) => {
+                    let text = text.trim().to_string();
+                    if !text.is_empty() && !is_hallucination(&text) {
+                        let mut display = accumulated_text.clone();
+                        if !display.is_empty() {
+                            display.push(' ');
+                        }
+                        display.push_str(&text);
+                        send!(StateMsg::PartialText(display));
+                    }
+                }
+                Err(e) => eprintln!("Partial transcription error: {e}"),
+            }
+            last_transcribe = Instant::now();
+        }
+    }
+
+    level_done.store(true, Ordering::Relaxed);
+
     if accumulated_text.is_empty() {
         send!(StateMsg::SetResult("No speech detected".to_string()));
+    } else if note_mode {
+        match crate::output::notes::save_to_notes(&accumulated_text) {
+            Ok(path) => {
+                send!(StateMsg::NoteSaved(path.display().to_string()));
+            }
+            Err(e) => {
+                send!(StateMsg::SetError(format!("Failed to save note: {e}")));
+            }
+        }
     } else {
         send!(StateMsg::SetResult(accumulated_text));
     }
@@ -459,6 +511,7 @@ fn is_hallucination(text: &str) -> bool {
         "like and subscribe",
         "(silence)",
         "[silence]",
+        "[blank_audio]",
         "...",
         "the end.",
         "bye.",
@@ -466,6 +519,7 @@ fn is_hallucination(text: &str) -> bool {
     hallucinations.iter().any(|h| t == *h)
         || t.chars().all(|c| c == '.' || c == ' ')
         || t.len() < 2
+        || (t.starts_with('[') && t.ends_with(']'))
 }
 
 fn apply_state(w: &PopupWidgets, state: State, text: Option<&str>) {
@@ -486,7 +540,7 @@ fn apply_state(w: &PopupWidgets, state: State, text: Option<&str>) {
             w.dot.remove_css_class("dot-loading");
             w.dot.remove_css_class("dot-done");
             w.dot.add_css_class("dot-recording");
-            w.status_label.set_text("Listening...");
+            w.status_label.set_text(if w.note_mode { "Private note..." } else { "Listening..." });
             w.level_frame.set_visible(true);
             w.stop_btn.set_visible(true);
             w.hint.set_text("Speak naturally...");

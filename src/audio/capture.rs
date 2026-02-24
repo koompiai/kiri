@@ -122,6 +122,55 @@ impl AudioCapture {
         Ok(audio)
     }
 
+    /// Start continuous audio capture. Returns the stream handle — recording
+    /// continues as long as the handle is alive (drop it to stop).
+    /// Audio accumulates in the internal buffer; read with `snapshot()`.
+    pub fn start_stream(&self) -> anyhow::Result<cpal::Stream> {
+        self.stop.store(false, Ordering::Relaxed);
+        self.frames.lock().unwrap().clear();
+
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| anyhow::anyhow!("No input device found"))?;
+
+        let config = cpal::StreamConfig {
+            channels: CHANNELS,
+            sample_rate: RECORD_RATE,
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        let frames = self.frames.clone();
+        let audio_level = self.audio_level.clone();
+
+        let stream = device.build_input_stream(
+            &config,
+            move |data: &[f32], _info: &cpal::InputCallbackInfo| {
+                frames.lock().unwrap().extend_from_slice(data);
+                let rms =
+                    (data.iter().map(|&s| s * s).sum::<f32>() / data.len() as f32).sqrt();
+                *audio_level.lock().unwrap() = rms;
+            },
+            move |err| {
+                eprintln!("Audio stream error: {err}");
+            },
+            None,
+        )?;
+
+        stream.play()?;
+        Ok(stream)
+    }
+
+    /// Return a copy of all captured audio so far.
+    pub fn snapshot(&self) -> Vec<f32> {
+        self.frames.lock().unwrap().clone()
+    }
+
+    /// Clear the audio buffer (e.g. after finalizing a segment).
+    pub fn clear_buffer(&self) {
+        self.frames.lock().unwrap().clear();
+    }
+
     pub fn get_level(&self) -> f32 {
         *self.audio_level.lock().unwrap()
     }

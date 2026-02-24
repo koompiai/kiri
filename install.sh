@@ -110,7 +110,7 @@ install_system_deps() {
         linux)
             if command -v pacman &>/dev/null; then
                 info "Installing system deps via pacman..."
-                sudo pacman -S --needed git cmake base-devel gtk4 libadwaita gtk4-layer-shell alsa-lib wl-clipboard ydotool
+                sudo pacman -S --needed git cmake base-devel gtk4 libadwaita gtk4-layer-shell alsa-lib wl-clipboard ydotool vulkan-headers vulkan-icd-loader
             elif command -v apt &>/dev/null; then
                 info "Installing system deps via apt..."
                 sudo apt install -y git cmake build-essential libgtk-4-dev libadwaita-1-dev libgtk-4-layer-shell-dev libasound2-dev wl-clipboard ydotool
@@ -184,6 +184,17 @@ else
     curl -L --progress-bar -o "$MODEL_FILE" \
         "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
     info "Model downloaded to $MODEL_FILE"
+fi
+
+# Wake word model (tiny)
+TINY_FILE="$MODEL_DIR/ggml-tiny.bin"
+if [ -f "$TINY_FILE" ]; then
+    info "Whisper tiny model already downloaded"
+else
+    info "Downloading Whisper tiny model for wake word (~75MB)..."
+    curl -L --progress-bar -o "$TINY_FILE" \
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"
+    info "Tiny model downloaded to $TINY_FILE"
 fi
 
 # ── PATH check ──────────────────────────────────────────────────────────────
@@ -284,6 +295,7 @@ echo
 echo "  Usage:"
 echo "    kiri popup            — voice popup (default)"
 echo "    kiri listen           — CLI transcription"
+echo "    kiri wake             — wake word detection (background)"
 echo "    kiri sync             — notes git status"
 echo
 echo "  Uninstall:"
