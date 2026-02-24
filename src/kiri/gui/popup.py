@@ -7,7 +7,8 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, GLib, Gtk
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gdk, GLib, Gtk, Gtk4LayerShell
 
 from kiri.audio.recorder import AudioRecorder
 from kiri.config import WHISPER_RATE
@@ -42,6 +43,14 @@ class VoicePopup(Gtk.Application):
         self.win.set_default_size(340, 140)
         self.win.set_resizable(False)
         self.win.set_decorated(False)
+
+        # Layer shell: anchor top-right
+        Gtk4LayerShell.init_for_window(self.win)
+        Gtk4LayerShell.set_layer(self.win, Gtk4LayerShell.Layer.TOP)
+        Gtk4LayerShell.set_anchor(self.win, Gtk4LayerShell.Edge.TOP, True)
+        Gtk4LayerShell.set_anchor(self.win, Gtk4LayerShell.Edge.RIGHT, True)
+        Gtk4LayerShell.set_margin(self.win, Gtk4LayerShell.Edge.TOP, 12)
+        Gtk4LayerShell.set_margin(self.win, Gtk4LayerShell.Edge.RIGHT, 12)
 
         # Escape key
         key_ctrl = Gtk.EventControllerKey()
