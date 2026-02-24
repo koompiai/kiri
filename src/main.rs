@@ -1,3 +1,4 @@
+mod audio;
 mod config;
 
 use clap::{Parser, Subcommand};
