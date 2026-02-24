@@ -16,6 +16,11 @@ def main():
                         help="OpenVINO device (default: GPU)")
     args = parser.parse_args()
 
+    # First-run onboarding
+    from kiri.onboarding import needs_onboarding, run_onboarding
+    if needs_onboarding():
+        run_onboarding()
+
     app = VoicePopup(language=args.lang, model_name=args.model, device=args.device)
     app.run([])
 

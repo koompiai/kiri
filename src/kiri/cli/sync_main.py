@@ -7,6 +7,8 @@ from kiri.sync import commit_notes, init_notes_repo, push_notes, status
 
 def main():
     parser = argparse.ArgumentParser(description="Kiri notes git sync")
+    parser.add_argument("--setup", action="store_true",
+                        help="Interactive setup — connect notes to GitHub")
     parser.add_argument("--init", metavar="URL",
                         help="Initialize ~/kiri/ as a git repo with GitHub remote URL")
     parser.add_argument("--push", action="store_true",
@@ -16,6 +18,11 @@ def main():
     parser.add_argument("--status", action="store_true",
                         help="Show sync status")
     args = parser.parse_args()
+
+    if args.setup:
+        from kiri.onboarding import setup_sync_interactive
+        setup_sync_interactive()
+        return
 
     if args.init:
         init_notes_repo(args.init)

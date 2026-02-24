@@ -36,6 +36,11 @@ def main():
         print("Available devices:", core.available_devices)
         return
 
+    # First-run onboarding
+    from kiri.onboarding import needs_onboarding, run_onboarding
+    if needs_onboarding():
+        run_onboarding()
+
     if not check_model(args.model):
         sys.exit(1)
 
