@@ -36,7 +36,8 @@ impl WakeWordDetector {
             channels: config::CHANNELS,
             endianness: Endianness::Little,
         };
-        config.detector.threshold = 0.40;
+        // DEBUG: threshold set very low to observe scores. Tune later.
+        config.detector.threshold = 0.15;
         config.detector.avg_threshold = 0.0;
         config.detector.min_scores = 1;
         config.detector.eager = true;
@@ -176,10 +177,20 @@ pub fn train_wakeword(name: &str, num_samples: usize) -> anyhow::Result<()> {
         // Record with silence detection
         eprintln!("  Recording...");
         capture.reset();
-        let audio = capture.record_with_silence_opts(1.5)?;
+        let audio = capture.record_with_silence_opts(1.0)?;
 
         if audio.len() < (config::RECORD_RATE as usize / 4) {
             eprintln!("  Too short, skipping. Try again.");
+            continue;
+        }
+
+        // Trim silence from start and end for tight MFCC templates
+        let audio = trim_training_audio(&audio, config::RECORD_RATE);
+        let duration = audio.len() as f32 / config::RECORD_RATE as f32;
+        eprintln!("  Trimmed to {duration:.1}s");
+
+        if audio.len() < (config::RECORD_RATE as usize / 4) {
+            eprintln!("  Too short after trimming, skipping. Try again.");
             continue;
         }
 
@@ -216,6 +227,46 @@ pub fn train_wakeword(name: &str, num_samples: usize) -> anyhow::Result<()> {
     eprintln!("\nNow run: kiri wake");
 
     Ok(())
+}
+
+/// Trim leading/trailing silence from training audio for tight MFCC templates.
+/// Keeps a small padding (50ms) around the speech.
+fn trim_training_audio(audio: &[f32], sample_rate: u32) -> Vec<f32> {
+    let window = sample_rate as usize / 50; // 20ms windows
+    let padding = sample_rate as usize / 20; // 50ms padding
+    let threshold = 0.02;
+
+    if audio.len() < window {
+        return audio.to_vec();
+    }
+
+    let start = audio
+        .chunks(window)
+        .position(|chunk| {
+            let rms = (chunk.iter().map(|&s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+            rms > threshold
+        })
+        .unwrap_or(0)
+        * window;
+
+    let end = audio.len()
+        - audio
+            .chunks(window)
+            .rev()
+            .position(|chunk| {
+                let rms = (chunk.iter().map(|&s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+                rms > threshold
+            })
+            .unwrap_or(0)
+            * window;
+
+    if start >= end {
+        return audio.to_vec();
+    }
+
+    let start = start.saturating_sub(padding);
+    let end = (end + padding).min(audio.len());
+    audio[start..end].to_vec()
 }
 
 fn save_wav(path: &Path, audio: &[f32], sample_rate: u32) -> anyhow::Result<()> {
