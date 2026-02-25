@@ -3,63 +3,95 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rustpotter::{
+    AudioFmt, Endianness, Rustpotter, RustpotterConfig, SampleFormat, WakewordRefBuildFromFiles,
+    WakewordRef, WakewordSave,
+};
+
 use crate::audio::capture::AudioCapture;
-use crate::audio::resample::resample_48k_to_16k;
 use crate::config;
-use crate::transcribe::whisper::WhisperEngine;
-
-/// Default wake phrases.
-pub const DEFAULT_PHRASES: &[&str] = &["hey kiri", "kiri", "koompi", "nimmit", "nadi", "private"];
-
-/// Seconds between analysis cycles.
-const WAKE_STRIDE: f32 = 1.5;
-
-/// Minimum audio duration worth transcribing (seconds).
-const MIN_AUDIO: f32 = 0.8;
-
-/// Minimum RMS to consider a window worth transcribing.
-const WAKE_VAD_THRESHOLD: f32 = 0.02;
-
-/// Maximum normalized edit distance for fuzzy matching (0.0–1.0).
-const MATCH_THRESHOLD: f32 = 0.35;
 
 /// Seconds to wait after activation before listening again.
 const COOLDOWN: u64 = 5;
 
 pub struct WakeWordDetector {
-    engine: WhisperEngine,
-    phrases: Vec<String>,
-    initial_prompt: String,
+    rustpotter: Rustpotter,
 }
 
 impl WakeWordDetector {
-    pub fn new(model_path: &Path, phrases: &[String]) -> anyhow::Result<Self> {
-        let engine = WhisperEngine::load(model_path)?;
-        let phrase_list: Vec<String> = phrases.iter().map(|p| p.to_lowercase()).collect();
-        let initial_prompt = phrases.join(". ") + ".";
-        Ok(Self {
-            engine,
-            phrases: phrase_list,
-            initial_prompt,
-        })
+    /// Load all .rpw wakeword files from the wakewords directory.
+    pub fn new() -> anyhow::Result<Self> {
+        let wakewords_dir = config::wakewords_dir();
+        if !wakewords_dir.exists() {
+            anyhow::bail!(
+                "No wakewords directory at {}.\nTrain a wake word first:\n  kiri train hey-kiri",
+                wakewords_dir.display()
+            );
+        }
+
+        let mut config = RustpotterConfig::default();
+        config.fmt = AudioFmt {
+            sample_rate: config::RECORD_RATE as usize,
+            sample_format: SampleFormat::F32,
+            channels: config::CHANNELS,
+            endianness: Endianness::Little,
+        };
+        config.detector.threshold = 0.40;
+        config.detector.avg_threshold = 0.0;
+        config.detector.min_scores = 1;
+        config.detector.eager = true;
+
+        let mut rustpotter =
+            Rustpotter::new(&config).map_err(|e| anyhow::anyhow!("Rustpotter init: {e}"))?;
+
+        let mut count = 0;
+        for entry in std::fs::read_dir(&wakewords_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "rpw") {
+                let name = path
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                rustpotter
+                    .add_wakeword_from_file(&name, path.to_str().unwrap())
+                    .map_err(|e| anyhow::anyhow!("Failed to load {}: {e}", path.display()))?;
+                eprintln!("  Loaded wake word: {name}");
+                count += 1;
+            }
+        }
+
+        if count == 0 {
+            anyhow::bail!(
+                "No .rpw files found in {}.\nTrain a wake word first:\n  kiri train hey-kiri",
+                wakewords_dir.display()
+            );
+        }
+
+        Ok(Self { rustpotter })
     }
 
-    /// Run the detection loop. Calls `on_wake` with the matched phrase.
-    /// Blocks until stop flag is set or process is killed.
+    /// Run the detection loop. Calls `on_wake` with the matched wake word name.
     pub fn listen_loop(
-        &self,
+        &mut self,
         stop: Arc<AtomicBool>,
         on_wake: impl Fn(&str),
     ) -> anyhow::Result<()> {
         let capture = AudioCapture::new();
         let _stream = capture.start_stream()?;
 
-        let stride = Duration::from_secs_f32(WAKE_STRIDE);
-        let min_samples = (MIN_AUDIO * config::RECORD_RATE as f32) as usize;
+        let frame_size = self.rustpotter.get_samples_per_frame();
         let mut last_activation = Instant::now() - Duration::from_secs(COOLDOWN + 1);
 
+        eprintln!("Listening... (frame size: {frame_size} samples)");
+        eprintln!("Press Ctrl+C to stop.");
+
+        let mut debug_counter = 0u32;
+
         loop {
-            std::thread::sleep(stride);
+            std::thread::sleep(Duration::from_millis(30));
 
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -72,101 +104,131 @@ impl WakeWordDetector {
             }
 
             let audio = capture.snapshot();
+            if audio.len() < frame_size {
+                continue;
+            }
             capture.clear_buffer();
 
-            if audio.len() < min_samples {
-                continue;
-            }
-
-            // Simple VAD: skip quiet windows
-            let rms =
-                (audio.iter().map(|&s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
-            if rms < WAKE_VAD_THRESHOLD {
-                continue;
-            }
-
-            // Resample and transcribe with prompt bias
-            let audio_16k = resample_48k_to_16k(&audio);
-            let text = match self
-                .engine
-                .transcribe_with_prompt(&audio_16k, "en", &self.initial_prompt)
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Wake word error: {e}");
-                    continue;
+            // Feed audio frames to rustpotter
+            let mut detected = false;
+            for chunk in audio.chunks_exact(frame_size) {
+                if let Some(detection) = self.rustpotter.process_samples(chunk.to_vec()) {
+                    eprintln!(
+                        "\n[kiri] Wake word detected: \"{}\" (score: {:.2}, avg: {:.2}, count: {})",
+                        detection.name, detection.score, detection.avg_score, detection.counter
+                    );
+                    last_activation = Instant::now();
+                    capture.clear_buffer(); // flush any audio that arrived during processing
+                    on_wake(&detection.name);
+                    detected = true;
+                    break;
                 }
-            };
-
-            let text_lower = text.trim().to_lowercase();
-            if text_lower.is_empty() {
-                continue;
+            }
+            if detected {
+                continue; // skip to cooldown on next iteration
             }
 
-            if let Some(phrase) = self.find_match(&text_lower) {
+            // Debug: always log partial detections when they exist
+            let rms = self.rustpotter.get_rms_level();
+            if let Some(partial) = self.rustpotter.get_partial_detection() {
                 eprintln!(
-                    "[kiri] Wake word detected: \"{}\" (heard: \"{}\")",
-                    phrase, text_lower
+                    "  partial: score={:.3} avg={:.3} count={} rms={:.4}",
+                    partial.score, partial.avg_score, partial.counter, rms
                 );
-                last_activation = Instant::now();
-                on_wake(&phrase);
+            } else {
+                debug_counter += 1;
+                if debug_counter % 33 == 0 {
+                    if rms > 0.01 {
+                        eprint!("*");
+                    } else {
+                        eprint!(".");
+                    }
+                }
             }
         }
 
         Ok(())
     }
-
-    fn find_match(&self, text: &str) -> Option<String> {
-        // Strip punctuation for matching
-        let clean: String = text
-            .chars()
-            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-            .collect();
-        let clean = clean.trim();
-
-        for phrase in &self.phrases {
-            // Exact substring match
-            if clean.contains(phrase.as_str()) {
-                return Some(phrase.clone());
-            }
-
-            // Fuzzy: sliding window of phrase-length words
-            let phrase_words: Vec<&str> = phrase.split_whitespace().collect();
-            let text_words: Vec<&str> = clean.split_whitespace().collect();
-
-            for window in text_words.windows(phrase_words.len().max(1)) {
-                let window_str = window.join(" ");
-                let dist = levenshtein(&window_str, phrase);
-                let max_len = window_str.len().max(phrase.len());
-                if max_len > 0 && (dist as f32 / max_len as f32) <= MATCH_THRESHOLD {
-                    return Some(phrase.clone());
-                }
-            }
-        }
-
-        None
-    }
 }
 
-/// Levenshtein edit distance between two strings.
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let (m, n) = (a.len(), b.len());
+/// Record audio samples and build a .rpw wake word reference file.
+pub fn train_wakeword(name: &str, num_samples: usize) -> anyhow::Result<()> {
+    let wakewords_dir = config::wakewords_dir();
+    std::fs::create_dir_all(&wakewords_dir)?;
 
-    let mut prev: Vec<usize> = (0..=n).collect();
-    let mut curr = vec![0; n + 1];
+    let samples_dir = wakewords_dir.join("samples");
+    std::fs::create_dir_all(&samples_dir)?;
 
-    for i in 1..=m {
-        curr[0] = i;
-        for j in 1..=n {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+    eprintln!("Training wake word: \"{name}\"");
+    eprintln!("You will record {num_samples} samples.");
+    eprintln!("Say the wake word after each prompt.\n");
+
+    let capture = AudioCapture::new();
+    let mut wav_paths = Vec::new();
+
+    for i in 1..=num_samples {
+        eprintln!("  [{i}/{num_samples}] Press Enter, then say \"{name}\"...");
+
+        // Wait for Enter
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+
+        // Record with silence detection
+        eprintln!("  Recording...");
+        capture.reset();
+        let audio = capture.record_with_silence_opts(1.5)?;
+
+        if audio.len() < (config::RECORD_RATE as usize / 4) {
+            eprintln!("  Too short, skipping. Try again.");
+            continue;
         }
-        std::mem::swap(&mut prev, &mut curr);
+
+        // Save as WAV
+        let wav_path = samples_dir.join(format!("{name}_{i}.wav"));
+        save_wav(&wav_path, &audio, config::RECORD_RATE)?;
+        eprintln!("  Saved: {}", wav_path.display());
+        wav_paths.push(wav_path);
     }
 
-    prev[n]
+    if wav_paths.len() < 3 {
+        anyhow::bail!("Need at least 3 samples, got {}. Try again.", wav_paths.len());
+    }
+
+    // Build wakeword reference from WAV files
+    eprintln!("\nBuilding wake word reference from {} samples...", wav_paths.len());
+    let sample_files: Vec<String> = wav_paths.iter().map(|p| p.to_str().unwrap().to_string()).collect();
+
+    let wakeword = WakewordRef::new_from_sample_files(
+        name.to_string(),
+        None, // use default threshold
+        None, // use default avg_threshold
+        sample_files,
+        16,   // mfcc_size
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to build wake word: {e}"))?;
+
+    let rpw_path = wakewords_dir.join(format!("{name}.rpw"));
+    wakeword
+        .save_to_file(rpw_path.to_str().unwrap())
+        .map_err(|e| anyhow::anyhow!("Failed to save: {e}"))?;
+
+    eprintln!("Wake word saved: {}", rpw_path.display());
+    eprintln!("\nNow run: kiri wake");
+
+    Ok(())
+}
+
+fn save_wav(path: &Path, audio: &[f32], sample_rate: u32) -> anyhow::Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)?;
+    for &sample in audio {
+        writer.write_sample(sample)?;
+    }
+    writer.finalize()?;
+    Ok(())
 }

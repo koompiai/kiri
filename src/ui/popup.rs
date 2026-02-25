@@ -13,10 +13,10 @@ use super::states::State;
 use super::styles::CSS;
 
 /// Seconds between partial transcription attempts during speech.
-const STREAM_INTERVAL: f32 = 4.0;
+/// Low because the tiny model is fast (~100ms).
+const STREAM_INTERVAL: f32 = 1.5;
 /// Seconds of silence after speech to finalize a segment and paste.
-/// Longer = more context for whisper = better accuracy.
-const SEGMENT_SILENCE: f32 = 2.0;
+const SEGMENT_SILENCE: f32 = 1.0;
 /// Minimum audio duration worth transcribing (seconds).
 const MIN_SEGMENT: f32 = 0.5;
 
@@ -52,9 +52,14 @@ struct PopupWidgets {
 pub fn run_popup(lang: String, model_path: PathBuf, note_mode: bool) -> anyhow::Result<()> {
     let app = Application::builder()
         .application_id("com.kiri.popup")
+        .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
     app.connect_activate(move |app| {
+        // Guard against duplicate activations (GTK single-instance re-activate)
+        if app.active_window().is_some() {
+            return;
+        }
         build_ui(app, lang.clone(), model_path.clone(), note_mode);
     });
 
@@ -292,13 +297,11 @@ fn build_ui(app: &Application, lang: String, model_path: PathBuf, note_mode: boo
     }
 }
 
-/// Background thread: continuous audio capture with periodic transcription.
+/// Background thread: two-model streaming transcription.
 ///
-/// Instead of recording chunk-by-chunk (wait for silence → transcribe → paste),
-/// this streams audio continuously and transcribes periodically:
-/// - Partial text shown every ~3s while speaking
-/// - Segment finalized and pasted after 1s silence
-/// - Session ends after 5s silence
+/// Loads the tiny model first (~0.5s) so the popup starts listening almost
+/// instantly, then loads the medium model in the background. Tiny handles
+/// live partial previews; medium (beam search) handles accurate finals.
 fn streaming_transcription(
     tx: mpsc::Sender<StateMsg>,
     stop: Arc<AtomicBool>,
@@ -314,18 +317,56 @@ fn streaming_transcription(
         };
     }
 
-    // --- Load whisper model ---
-    let engine = match crate::transcribe::whisper::WhisperEngine::load(&model_path) {
-        Ok(e) => e,
-        Err(e) => {
-            send!(StateMsg::SetError(format!("Model load failed: {e}")));
-            std::thread::sleep(Duration::from_secs(3));
-            send!(StateMsg::Quit);
-            return;
+    // --- Load tiny model first for instant responsiveness ---
+    let tiny_path = crate::config::wake_model_path();
+    let fast_engine = if tiny_path.exists() {
+        match crate::transcribe::whisper::WhisperEngine::load(&tiny_path) {
+            Ok(e) => Some(e),
+            Err(e) => {
+                eprintln!("Tiny model load failed, using main model only: {e}");
+                None
+            }
         }
+    } else {
+        None
     };
 
-    send!(StateMsg::SetState(State::Listening));
+    // If we have the tiny model, start listening immediately while medium loads
+    if fast_engine.is_some() {
+        send!(StateMsg::SetState(State::Listening));
+    }
+
+    // --- Load medium model (in background if tiny is available) ---
+    let main_engine_rx = {
+        let (etx, erx) = mpsc::channel();
+        let mp = model_path.clone();
+        std::thread::spawn(move || {
+            let _ = etx.send(crate::transcribe::whisper::WhisperEngine::load(&mp));
+        });
+        erx
+    };
+
+    // If we had no tiny model, we must wait for medium before we can proceed
+    let (fast_engine, mut main_engine) = if let Some(fe) = fast_engine {
+        (fe, None)
+    } else {
+        match main_engine_rx
+            .recv()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("Engine loader thread died")))
+        {
+            Ok(e) => {
+                send!(StateMsg::SetState(State::Listening));
+                // Use medium as both fast and main
+                (e, None::<crate::transcribe::whisper::WhisperEngine>)
+            }
+            Err(e) => {
+                send!(StateMsg::SetError(format!("Model load failed: {e}")));
+                std::thread::sleep(Duration::from_secs(3));
+                send!(StateMsg::Quit);
+                return;
+            }
+        }
+    };
 
     let capture = crate::audio::capture::AudioCapture::new();
     let audio_level = capture.audio_level.clone();
@@ -370,6 +411,16 @@ fn streaming_transcription(
             break;
         }
 
+        // Check if medium model finished loading in the background
+        if main_engine.is_none() {
+            if let Ok(result) = main_engine_rx.try_recv() {
+                match result {
+                    Ok(e) => main_engine = Some(e),
+                    Err(e) => eprintln!("Medium model load failed: {e}"),
+                }
+            }
+        }
+
         // Track speech/silence from audio level
         let level = capture.get_level();
         let now = Instant::now();
@@ -410,7 +461,13 @@ fn streaming_transcription(
             if duration >= MIN_SEGMENT {
                 send!(StateMsg::SetState(State::Transcribing));
                 let audio_16k = crate::audio::resample::resample_48k_to_16k(&audio);
-                if let Ok(text) = engine.transcribe(&audio_16k, &lang) {
+                // Use medium beam search if available, else fast greedy
+                let result = if let Some(ref me) = main_engine {
+                    me.transcribe(&audio_16k, &lang)
+                } else {
+                    fast_engine.transcribe_fast(&audio_16k, &lang)
+                };
+                if let Ok(text) = result {
                     let text = text.trim().to_string();
                     if !text.is_empty() && !is_hallucination(&text) {
                         if !note_mode {
@@ -427,10 +484,33 @@ fn streaming_transcription(
         }
 
         // Finalize segment: silence detected after speech, enough audio
+        // Use medium model (beam search) for accuracy, fall back to tiny
         if had_speech && silence_secs >= SEGMENT_SILENCE && duration >= MIN_SEGMENT {
             send!(StateMsg::SetState(State::Transcribing));
+
+            // Wait briefly for medium model if it's still loading
+            if main_engine.is_none() {
+                eprintln!("[kiri] Medium model not ready, waiting up to 3s...");
+                if let Ok(result) = main_engine_rx.recv_timeout(Duration::from_secs(3)) {
+                    match result {
+                        Ok(e) => {
+                            eprintln!("[kiri] Medium model loaded just in time");
+                            main_engine = Some(e);
+                        }
+                        Err(e) => eprintln!("[kiri] Medium model failed: {e}"),
+                    }
+                }
+            }
+
             let audio_16k = crate::audio::resample::resample_48k_to_16k(&audio);
-            match engine.transcribe(&audio_16k, &lang) {
+            let result = if let Some(ref me) = main_engine {
+                eprintln!("[kiri] Final transcription: medium model (beam search)");
+                me.transcribe(&audio_16k, &lang)
+            } else {
+                eprintln!("[kiri] Final transcription: tiny model (greedy fallback)");
+                fast_engine.transcribe_fast(&audio_16k, &lang)
+            };
+            match result {
                 Ok(text) => {
                     let text = text.trim().to_string();
                     if !text.is_empty() && !is_hallucination(&text) {
@@ -454,13 +534,13 @@ fn streaming_transcription(
             continue;
         }
 
-        // Periodic partial transcription while speaking (fast greedy for preview)
+        // Periodic partial transcription while speaking (tiny model, very fast)
         if new_speech
-            && duration >= 2.0
+            && duration >= 1.0
             && last_transcribe.elapsed().as_secs_f32() >= STREAM_INTERVAL
         {
             let audio_16k = crate::audio::resample::resample_48k_to_16k(&audio);
-            match engine.transcribe_fast(&audio_16k, &lang) {
+            match fast_engine.transcribe_fast(&audio_16k, &lang) {
                 Ok(text) => {
                     let text = text.trim().to_string();
                     if !text.is_empty() && !is_hallucination(&text) {

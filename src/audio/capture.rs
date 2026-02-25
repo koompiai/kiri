@@ -171,6 +171,16 @@ impl AudioCapture {
         self.frames.lock().unwrap().clear();
     }
 
+    /// Drain old audio, keeping the last `keep` samples for overlap.
+    /// Prevents unbounded growth while preserving context across windows.
+    pub fn drain_keeping_last(&self, keep: usize) {
+        let mut frames = self.frames.lock().unwrap();
+        if frames.len() > keep {
+            let start = frames.len() - keep;
+            *frames = frames[start..].to_vec();
+        }
+    }
+
     pub fn get_level(&self) -> f32 {
         *self.audio_level.lock().unwrap()
     }

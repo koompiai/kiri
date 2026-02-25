@@ -25,3 +25,7 @@ pub fn default_model_path() -> PathBuf {
 pub fn wake_model_path() -> PathBuf {
     models_dir().join("ggml-tiny.bin")
 }
+
+pub fn wakewords_dir() -> PathBuf {
+    dirs::data_dir().unwrap().join("kiri").join("wakewords")
+}

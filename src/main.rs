@@ -37,8 +37,16 @@ enum Commands {
     },
     /// Notes git sync
     Sync,
-    /// Listen for wake word and launch popup
+    /// Listen for wake words and launch popup
     Wake,
+    /// Record samples and train a wake word
+    Train {
+        /// Wake word name (e.g. "hey-kiri", "koompi")
+        name: String,
+        /// Number of samples to record (default: 5)
+        #[arg(short = 'n', long, default_value_t = 5)]
+        samples: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -87,47 +95,26 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Commands::Wake) => {
-            let model_path = cli
-                .model
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(config::wake_model_path);
-
-            if !model_path.exists() {
-                anyhow::bail!(
-                    "Wake word model not found at {}.\nDownload it:\n  curl -L -o {} \
-                     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
-                    model_path.display(),
-                    model_path.display()
-                );
-            }
-
-            let phrases: Vec<String> = wakeword::DEFAULT_PHRASES
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-
-            eprintln!("Loading wake word model from {}...", model_path.display());
-            let detector = wakeword::WakeWordDetector::new(&model_path, &phrases)?;
-            eprintln!(
-                "Listening for: {}",
-                wakeword::DEFAULT_PHRASES.join(", ")
-            );
-            eprintln!("Press Ctrl+C to stop.");
+            eprintln!("Loading wake words...");
+            let mut detector = wakeword::WakeWordDetector::new()?;
 
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            detector.listen_loop(stop, |phrase| {
-                if phrase == "private" {
-                    eprintln!("[kiri] Private note mode (triggered by: {phrase})");
+            detector.listen_loop(stop, |name| {
+                if name == "private" {
+                    eprintln!("[kiri] Private note mode (triggered by: {name})");
                     let _ = std::process::Command::new("kiri")
                         .args(["popup", "--note"])
                         .spawn();
                 } else {
-                    eprintln!("[kiri] Launching popup (triggered by: {phrase})");
+                    eprintln!("[kiri] Launching popup (triggered by: {name})");
                     let _ = std::process::Command::new("kiri").arg("popup").spawn();
                 }
             })?;
 
             Ok(())
+        }
+        Some(Commands::Train { name, samples }) => {
+            wakeword::train_wakeword(&name, samples)
         }
         None => {
             let model_path = cli
